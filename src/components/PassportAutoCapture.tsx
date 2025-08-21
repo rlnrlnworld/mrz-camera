@@ -47,7 +47,6 @@ export default function PassportAutoCapture({
   const startedAtRef = useRef<number>(0);
   const lastShotAtRef = useRef<number | null>(null);
 
-  // --- 페이지 진입 즉시 카메라 시작 ---
   useEffect(() => {
     (async () => {
       try {
@@ -92,7 +91,6 @@ export default function PassportAutoCapture({
     setReadyVisual(false);
   };
 
-  // --- 뷰 좌표 → 비디오 좌표 ---
   const computeRoiRect = useCallback(() => {
     const container = videoRef.current?.parentElement;
     const guide = document.getElementById("passport-guide-box");
@@ -112,7 +110,6 @@ export default function PassportAutoCapture({
     const vw = video.videoWidth, vh = video.videoHeight;
     if (!vw || !vh) return null;
 
-    // object-contain 매핑
     const scale = Math.min(roiInView.containerW / vw, roiInView.containerH / vh);
     const drawnW = vw * scale, drawnH = vh * scale;
     const offsetX = (roiInView.containerW - drawnW) / 2;
@@ -125,7 +122,6 @@ export default function PassportAutoCapture({
     return { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) };
   }, []);
 
-  // --- countEdge helper ---
   const countEdge = (
     sobel: Float32Array, w: number, h: number,
     sx: number, sy: number, sw: number, sh: number,
@@ -141,17 +137,14 @@ export default function PassportAutoCapture({
     return c;
   };
 
-  // --- ROI 분석 (히스테리시스: 표시/촬영 임계 분리) ---
   const analyzeRoi = useCallback((imgData: ImageData) => {
     const { data, width, height } = imgData;
 
-    // gray
     const gray = new Uint8ClampedArray(width * height);
     for (let i = 0, j = 0; i < data.length; i += 4, j++) {
       gray[j] = (0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]) | 0;
     }
 
-    // Laplacian variance(초점)
     let lapVar = 0, meanL = 0;
     const lap = new Float32Array(width * height);
     const k = [0,1,0,1,-4,1,0,1,0];
@@ -170,12 +163,10 @@ export default function PassportAutoCapture({
     for (let i = 0; i < lap.length; i++) { const d = lap[i] - meanL; lapVar += d * d; }
     lapVar /= N;
 
-    // 밝기 채움
     let bright = 0;
     for (let i = 0; i < gray.length; i++) if (gray[i] > 60) bright++;
     const fillRatio = bright / gray.length;
 
-    // Sobel
     const sobel = new Float32Array(width * height);
     const kx = [-1,0,1,-2,0,2,-1,0,1];
     const ky = [-1,-2,-1,0,0,0,1,2,1];
@@ -193,18 +184,15 @@ export default function PassportAutoCapture({
       }
     }
 
-    // 동적 임계치 2종: 화면표시/촬영
     let sum = 0, sum2 = 0;
     for (let i = 0; i < sobel.length; i++) { const v = sobel[i]; sum += v; sum2 += v * v; }
     const mean = sum / sobel.length;
     const std = Math.sqrt(Math.max(0, sum2 / sobel.length - mean * mean));
-    const thrVisual  = mean + 0.6 * std; // 느슨
-    const thrCapture = mean + 0.8 * std; // 엄격
+    const thrVisual  = mean + 0.6 * std;
+    const thrCapture = mean + 0.8 * std;
 
-    // 테두리 밴드 두께(유지 요청)
     const band = Math.max(1, Math.round((opts.edgeBandFrac ?? DEFAULT_OPTS.edgeBandFrac!) * Math.min(width, height)));
 
-    // 표시용 비율
     const topV   = countEdge(sobel, width, height, 0, 0, width, band, thrVisual);
     const botV   = countEdge(sobel, width, height, 0, height - band, width, band, thrVisual);
     const leftV  = countEdge(sobel, width, height, 0, 0, band, height, thrVisual);
@@ -217,7 +205,6 @@ export default function PassportAutoCapture({
       rightR: rightV / (height * band),
     };
 
-    // 촬영용 비율
     const topC   = countEdge(sobel, width, height, 0, 0, width, band, thrCapture);
     const botC   = countEdge(sobel, width, height, 0, height - band, width, band, thrCapture);
     const leftC  = countEdge(sobel, width, height, 0, 0, band, height, thrCapture);
@@ -251,7 +238,6 @@ export default function PassportAutoCapture({
     onCaptured?.({ blob, dataUrl });
   }, [onCaptured]);
 
-  // --- 메인 루프 ---
   const startLoop = useCallback(() => {
     const loop = () => {
       rafRef.current = requestAnimationFrame(loop);
@@ -265,11 +251,9 @@ export default function PassportAutoCapture({
       const roiVid = guideToVideoRect(roiInView);
       if (!roiVid) return;
 
-      // 비율 체크(가이드 왜곡 방지)
       const ratio = roiVid.w / roiVid.h;
       const ratioOk = Math.abs(ratio - GUIDE_RATIO) <= 0.08;
 
-      // 분석용 다운스케일
       const W = 480;
       const scale = W / roiVid.w;
       const H = Math.max(1, Math.round(roiVid.h * scale));
@@ -283,7 +267,6 @@ export default function PassportAutoCapture({
       const img = wctx.getImageData(0, 0, W, H);
       const { lapVar, fillRatio, edgeV, edgeC, gray } = analyzeRoi(img);
 
-      // 모션(프레임간 평균차)
       let motion = 255;
       if (prevFrameRef.current && prevFrameRef.current.length === gray.length) {
         let sum = 0;
@@ -292,16 +275,14 @@ export default function PassportAutoCapture({
       }
       prevFrameRef.current = gray;
 
-      // 공통 보조조건
       const passSharp = lapVar >= (opts.sharpnessMin ?? DEFAULT_OPTS.sharpnessMin!);
       const passFill  = fillRatio >= (opts.fillMin ?? DEFAULT_OPTS.fillMin!);
       const passMotion = motion <= (opts.motionMax ?? DEFAULT_OPTS.motionMax!);
       const elapsed = (performance.now() - startedAtRef.current) / 1000;
       const passTime = elapsed >= (opts.minSecondsBeforeCapture ?? DEFAULT_OPTS.minSecondsBeforeCapture!);
 
-      // 히스테리시스: 표시(느슨), 촬영(엄격)
       const edgeMinCapture = (opts.edgeRatioMin ?? DEFAULT_OPTS.edgeRatioMin!);
-      const edgeMinVisual  = Math.max(0, edgeMinCapture - 0.02); // 시각화 기준만 살짝 느슨
+      const edgeMinVisual  = Math.max(0, edgeMinCapture - 0.02);
 
       const passEdgesVisual =
         edgeV.topR >= edgeMinVisual && edgeV.botR >= edgeMinVisual &&
@@ -316,7 +297,6 @@ export default function PassportAutoCapture({
 
       const capturePass = passSharp && passFill && passMotion && passEdgesCapture && ratioOk && passTime;
 
-      // 감점형 카운터(프레임 흔들림 내성)
       const N = (opts.consecutiveFrames ?? DEFAULT_OPTS.consecutiveFrames!) || 8;
       if (capturePass && !isCapturing) {
         stableCountRef.current = Math.min(N, stableCountRef.current + 1);
@@ -324,7 +304,6 @@ export default function PassportAutoCapture({
         stableCountRef.current = Math.max(0, stableCountRef.current - 1);
       }
 
-      // 캡처 트리거 + 쿨다운(1.5s)
       const now = performance.now();
       const cooldownMs = 1500;
       const canShoot = !lastShotAtRef.current || now - lastShotAtRef.current > cooldownMs;
@@ -339,7 +318,6 @@ export default function PassportAutoCapture({
         });
       }
 
-      // 실패 이유 한 줄
       const reasons: string[] = [];
       if (!passTime) reasons.push("카메라 안정화 중…");
       if (!passSharp) reasons.push("초점 부족");
@@ -355,7 +333,6 @@ export default function PassportAutoCapture({
 
   return (
     <div className="relative w-full h-[100dvh] bg-black overflow-hidden">
-      {/* 비디오 */}
       <video
         ref={videoRef}
         playsInline
@@ -363,11 +340,10 @@ export default function PassportAutoCapture({
         className="absolute inset-0 w-full h-full object-contain bg-black"
       />
 
-      {/* 큰 세로형 가이드 (조건 충족=초록, 미충족=빨강) */}
       <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
         <div
           id="passport-guide-box"
-          className={`relative rounded-xl border-4 ${readyVisual ? "border-emerald-500" : "border-red-500"}`}
+          className={`relative rounded-xl border-2 ${readyVisual ? "border-emerald-500" : "border-red-500"}`}
           style={{
             aspectRatio: `${GUIDE_RATIO} / 1`,
             height: "min(85vh, 95vw)",
@@ -377,12 +353,10 @@ export default function PassportAutoCapture({
         </div>
       </div>
 
-      {/* 상단 안내 */}
-      <div className="absolute left-1/2 -translate-x-1/2 top-4 text-white/90 text-xs sm:text-sm px-3 py-1 rounded-full bg-black/50">
-        여권 한 면을 가이드에 꽉 채워 평행하게 맞춘 뒤 잠시 고정해주세요. 조건 충족 시 자동 촬영됩니다.
+      <div className="absolute left-1/2 -translate-x-1/2 top-4 text-nowrap text-white/90 text-xs sm:text-sm px-3 py-1 rounded-lg bg-black/50">
+        여권 한 면을 가이드에 꽉 채워 평행하게 맞춘 뒤 잠시 고정해주세요.<br />조건 충족 시 자동 촬영됩니다.
       </div>
 
-      {/* 하단 작은 상태/문제 문구 */}
       <div className="absolute left-1/2 -translate-x-1/2 bottom-3 text-[11px] sm:text-xs text-white/80">
         {error ? error : readyVisual ? "좋아요! 자동 촬영 준비 완료" : whyNot}
       </div>
