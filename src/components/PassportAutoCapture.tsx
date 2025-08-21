@@ -3,22 +3,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 type AutoCaptureOptions = {
-  consecutiveFrames?: number;
-  sharpnessMin?: number;
-  fillMin?: number;
-  motionMax?: number;
-  edgeBandFrac?: number;
-  edgeRatioMin?: number;
-  minSecondsBeforeCapture?: number;
+  consecutiveFrames?: number;        // 연속 통과 프레임 수(트리거)
+  sharpnessMin?: number;             // 라플라시안 분산 최소(초점)
+  fillMin?: number;                  // 밝기 채움 비율 최소
+  motionMax?: number;                // 프레임간 평균 차이 최대(안정도)
+  edgeBandFrac?: number;             // ⛔️ 요청대로 변경하지 않음
+  edgeRatioMin?: number;             // ⛔️ 요청대로 변경하지 않음
+  minSecondsBeforeCapture?: number;  // 시작 후 최소 대기 시간
 };
 
 const DEFAULT_OPTS: AutoCaptureOptions = {
   consecutiveFrames: 8,
-  sharpnessMin: 35,       // 초점(라플라시안 분산) 임계
-  fillMin: 0.10,          // 충분한 밝기 비율
-  motionMax: 10,          // 프레임간 차이(손떨림) 허용치
-  edgeBandFrac: 0.08,     // 테두리 밴드 두께 비율(ROI 대비)
-  edgeRatioMin: 0.05,     // 밴드 내 에지 픽셀 비율 임계
+  sharpnessMin: 35,
+  fillMin: 0.10,
+  motionMax: 10,
+  edgeBandFrac: 0.08,   // 그대로 유지
+  edgeRatioMin: 0.05,   // 그대로 유지
   minSecondsBeforeCapture: 1.0,
 };
 
@@ -45,6 +45,7 @@ export default function PassportAutoCapture({
   const prevFrameRef = useRef<Uint8ClampedArray | null>(null);
   const stableCountRef = useRef(0);
   const startedAtRef = useRef<number>(0);
+  const lastShotAtRef = useRef<number | null>(null);
 
   // --- 페이지 진입 즉시 카메라 시작 ---
   useEffect(() => {
@@ -140,7 +141,7 @@ export default function PassportAutoCapture({
     return c;
   };
 
-  // --- ROI 분석 ---
+  // --- ROI 분석 (히스테리시스: 표시/촬영 임계 분리) ---
   const analyzeRoi = useCallback((imgData: ImageData) => {
     const { data, width, height } = imgData;
 
@@ -192,26 +193,44 @@ export default function PassportAutoCapture({
       }
     }
 
-    // 동적 임계치: mean + 1.2*std
+    // 동적 임계치 2종: 화면표시/촬영
     let sum = 0, sum2 = 0;
     for (let i = 0; i < sobel.length; i++) { const v = sobel[i]; sum += v; sum2 += v * v; }
     const mean = sum / sobel.length;
     const std = Math.sqrt(Math.max(0, sum2 / sobel.length - mean * mean));
-    const thr = mean + 0.8 * std; // 1.0~1.5 사이 튜닝 가능
+    const thrVisual  = mean + 0.6 * std; // 느슨
+    const thrCapture = mean + 0.8 * std; // 엄격
 
-    // 테두리 밴드 에지 비율
+    // 테두리 밴드 두께(유지 요청)
     const band = Math.max(1, Math.round((opts.edgeBandFrac ?? DEFAULT_OPTS.edgeBandFrac!) * Math.min(width, height)));
-    const topCount   = countEdge(sobel, width, height, 0, 0, width, band, thr);
-    const botCount   = countEdge(sobel, width, height, 0, height - band, width, band, thr);
-    const leftCount  = countEdge(sobel, width, height, 0, 0, band, height, thr);
-    const rightCount = countEdge(sobel, width, height, width - band, 0, band, height, thr);
 
-    const topR = topCount / (width * band);
-    const botR = botCount / (width * band);
-    const leftR = leftCount / (height * band);
-    const rightR = rightCount / (height * band);
+    // 표시용 비율
+    const topV   = countEdge(sobel, width, height, 0, 0, width, band, thrVisual);
+    const botV   = countEdge(sobel, width, height, 0, height - band, width, band, thrVisual);
+    const leftV  = countEdge(sobel, width, height, 0, 0, band, height, thrVisual);
+    const rightV = countEdge(sobel, width, height, width - band, 0, band, height, thrVisual);
 
-    return { lapVar, fillRatio, edge: { topR, botR, leftR, rightR }, gray };
+    const edgeV = {
+      topR: topV / (width * band),
+      botR: botV / (width * band),
+      leftR: leftV / (height * band),
+      rightR: rightV / (height * band),
+    };
+
+    // 촬영용 비율
+    const topC   = countEdge(sobel, width, height, 0, 0, width, band, thrCapture);
+    const botC   = countEdge(sobel, width, height, 0, height - band, width, band, thrCapture);
+    const leftC  = countEdge(sobel, width, height, 0, 0, band, height, thrCapture);
+    const rightC = countEdge(sobel, width, height, width - band, 0, band, height, thrCapture);
+
+    const edgeC = {
+      topR: topC / (width * band),
+      botR: botC / (width * band),
+      leftR: leftC / (height * band),
+      rightR: rightC / (height * band),
+    };
+
+    return { lapVar, fillRatio, edgeV, edgeC, gray };
   }, [opts.edgeBandFrac]);
 
   const captureAndSend = useCallback(async (roiVid: { x: number; y: number; w: number; h: number }) => {
@@ -250,7 +269,7 @@ export default function PassportAutoCapture({
       const ratio = roiVid.w / roiVid.h;
       const ratioOk = Math.abs(ratio - GUIDE_RATIO) <= 0.08;
 
-      // 분석용 다운스케일 해상도 ↑
+      // 분석용 다운스케일
       const W = 480;
       const scale = W / roiVid.w;
       const H = Math.max(1, Math.round(roiVid.h * scale));
@@ -262,7 +281,7 @@ export default function PassportAutoCapture({
       wctx.drawImage(video, roiVid.x, roiVid.y, roiVid.w, roiVid.h, 0, 0, W, H);
 
       const img = wctx.getImageData(0, 0, W, H);
-      const { lapVar, fillRatio, edge, gray } = analyzeRoi(img);
+      const { lapVar, fillRatio, edgeV, edgeC, gray } = analyzeRoi(img);
 
       // 모션(프레임간 평균차)
       let motion = 255;
@@ -273,42 +292,62 @@ export default function PassportAutoCapture({
       }
       prevFrameRef.current = gray;
 
+      // 공통 보조조건
       const passSharp = lapVar >= (opts.sharpnessMin ?? DEFAULT_OPTS.sharpnessMin!);
-      const passFill = fillRatio >= (opts.fillMin ?? DEFAULT_OPTS.fillMin!);
+      const passFill  = fillRatio >= (opts.fillMin ?? DEFAULT_OPTS.fillMin!);
       const passMotion = motion <= (opts.motionMax ?? DEFAULT_OPTS.motionMax!);
-      const edgeMin = (opts.edgeRatioMin ?? DEFAULT_OPTS.edgeRatioMin!);
-      const passEdges = edge.topR >= edgeMin && edge.botR >= edgeMin && edge.leftR >= edgeMin && edge.rightR >= edgeMin;
-
       const elapsed = (performance.now() - startedAtRef.current) / 1000;
       const passTime = elapsed >= (opts.minSecondsBeforeCapture ?? DEFAULT_OPTS.minSecondsBeforeCapture!);
 
-      const allPass = passSharp && passFill && passMotion && passEdges && ratioOk && passTime;
-      setReadyVisual(allPass);
+      // 히스테리시스: 표시(느슨), 촬영(엄격)
+      const edgeMinCapture = (opts.edgeRatioMin ?? DEFAULT_OPTS.edgeRatioMin!);
+      const edgeMinVisual  = Math.max(0, edgeMinCapture - 0.02); // 시각화 기준만 살짝 느슨
 
-      // 실패 이유 한 줄로
+      const passEdgesVisual =
+        edgeV.topR >= edgeMinVisual && edgeV.botR >= edgeMinVisual &&
+        edgeV.leftR >= edgeMinVisual && edgeV.rightR >= edgeMinVisual;
+
+      const passEdgesCapture =
+        edgeC.topR >= edgeMinCapture && edgeC.botR >= edgeMinCapture &&
+        edgeC.leftR >= edgeMinCapture && edgeC.rightR >= edgeMinCapture;
+
+      const visualPass = passSharp && passFill && passMotion && passEdgesVisual && ratioOk && passTime;
+      setReadyVisual(visualPass);
+
+      const capturePass = passSharp && passFill && passMotion && passEdgesCapture && ratioOk && passTime;
+
+      // 감점형 카운터(프레임 흔들림 내성)
+      const N = (opts.consecutiveFrames ?? DEFAULT_OPTS.consecutiveFrames!) || 8;
+      if (capturePass && !isCapturing) {
+        stableCountRef.current = Math.min(N, stableCountRef.current + 1);
+      } else {
+        stableCountRef.current = Math.max(0, stableCountRef.current - 1);
+      }
+
+      // 캡처 트리거 + 쿨다운(1.5s)
+      const now = performance.now();
+      const cooldownMs = 1500;
+      const canShoot = !lastShotAtRef.current || now - lastShotAtRef.current > cooldownMs;
+
+      if (!isCapturing && stableCountRef.current >= N && canShoot) {
+        setIsCapturing(true);
+        lastShotAtRef.current = now;
+        captureAndSend(roiVid).finally(() => {
+          setIsCapturing(false);
+          stableCountRef.current = 0;
+          // setReadyVisual(false); // 필요하면 촬영 후 잠깐 끄기
+        });
+      }
+
+      // 실패 이유 한 줄
       const reasons: string[] = [];
       if (!passTime) reasons.push("카메라 안정화 중…");
       if (!passSharp) reasons.push("초점 부족");
       if (!passFill) reasons.push("너무 어두움");
       if (!passMotion) reasons.push("손떨림/움직임");
-      if (!passEdges) reasons.push("테두리 감지 부족");
       if (!ratioOk) reasons.push("거리/각도 불일치");
+      if (!passEdgesCapture) reasons.push("테두리 감지 부족");
       setWhyNot(reasons.join(" · ") || "정상");
-
-      if (allPass && !isCapturing) {
-        stableCountRef.current += 1;
-        if (stableCountRef.current >= (opts.consecutiveFrames ?? DEFAULT_OPTS.consecutiveFrames!)) {
-          setIsCapturing(true);
-          captureAndSend(roiVid).finally(() => {
-            // 연속 촬영 원하면 아래만 리셋
-            setIsCapturing(false);
-            stableCountRef.current = 0;
-            setReadyVisual(false);
-          });
-        }
-      } else {
-        stableCountRef.current = 0;
-      }
     };
 
     rafRef.current = requestAnimationFrame(loop);
@@ -331,7 +370,7 @@ export default function PassportAutoCapture({
           className={`relative rounded-xl border-4 ${readyVisual ? "border-emerald-500" : "border-red-500"}`}
           style={{
             aspectRatio: `${GUIDE_RATIO} / 1`,
-            height: "min(85vh, 95vw)", // 화면 거의 가득
+            height: "min(85vh, 95vw)",
           }}
         >
           <div className="absolute inset-0 rounded-xl shadow-[0_0_0_9999px_rgba(0,0,0,0.35)]" />
