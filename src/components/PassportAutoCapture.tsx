@@ -14,15 +14,16 @@ type AutoCaptureOptions = {
 
 const DEFAULT_OPTS: AutoCaptureOptions = {
   consecutiveFrames: 8,
-  sharpnessMin: 35,
-  fillMin: 0.12,
-  motionMax: 8,
-  edgeBandFrac: 0.10,
-  edgeRatioMin: 0.12,
-  minSecondsBeforeCapture: 1.2,
+  sharpnessMin: 35,       // 초점(라플라시안 분산) 임계
+  fillMin: 0.10,          // 충분한 밝기 비율
+  motionMax: 10,          // 프레임간 차이(손떨림) 허용치
+  edgeBandFrac: 0.14,     // 테두리 밴드 두께 비율(ROI 대비)
+  edgeRatioMin: 0.10,     // 밴드 내 에지 픽셀 비율 임계
+  minSecondsBeforeCapture: 1.0,
 };
 
-const GUIDE_RATIO = 0.70; // 폭:높이 ≈ 88:125 (여권 한 면 세로형)
+// 여권 한 면 비율(폭:높이 ≈ 88:125)
+const GUIDE_RATIO = 0.70; // width / height
 
 export default function PassportAutoCapture({
   onCaptured,
@@ -38,14 +39,14 @@ export default function PassportAutoCapture({
   const [error, setError] = useState<string | null>(null);
   const [isCapturing, setIsCapturing] = useState(false);
   const [readyVisual, setReadyVisual] = useState(false);
-  const [whyNot, setWhyNot] = useState<string>(""); // 실패 이유 표시용(작은 글씨)
+  const [whyNot, setWhyNot] = useState<string>("");
 
   const workCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const prevFrameRef = useRef<Uint8ClampedArray | null>(null);
   const stableCountRef = useRef(0);
   const startedAtRef = useRef<number>(0);
 
-  // 페이지 진입 즉시 카메라 시작
+  // --- 페이지 진입 즉시 카메라 시작 ---
   useEffect(() => {
     (async () => {
       try {
@@ -90,7 +91,7 @@ export default function PassportAutoCapture({
     setReadyVisual(false);
   };
 
-  // 뷰 좌표 → 비디오 좌표 매핑
+  // --- 뷰 좌표 → 비디오 좌표 ---
   const computeRoiRect = useCallback(() => {
     const container = videoRef.current?.parentElement;
     const guide = document.getElementById("passport-guide-box");
@@ -110,6 +111,7 @@ export default function PassportAutoCapture({
     const vw = video.videoWidth, vh = video.videoHeight;
     if (!vw || !vh) return null;
 
+    // object-contain 매핑
     const scale = Math.min(roiInView.containerW / vw, roiInView.containerH / vh);
     const drawnW = vw * scale, drawnH = vh * scale;
     const offsetX = (roiInView.containerW - drawnW) / 2;
@@ -122,7 +124,23 @@ export default function PassportAutoCapture({
     return { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) };
   }, []);
 
-  // 분석(밝기/초점/모션 + 테두리 에지)
+  // --- countEdge helper ---
+  const countEdge = (
+    sobel: Float32Array, w: number, h: number,
+    sx: number, sy: number, sw: number, sh: number,
+    thr: number
+  ) => {
+    let c = 0;
+    for (let y = sy; y < sy + sh; y++) {
+      const row = y * w;
+      for (let x = sx; x < sx + sw; x++) {
+        if (sobel[row + x] > thr) c++;
+      }
+    }
+    return c;
+  };
+
+  // --- ROI 분석 ---
   const analyzeRoi = useCallback((imgData: ImageData) => {
     const { data, width, height } = imgData;
 
@@ -132,8 +150,8 @@ export default function PassportAutoCapture({
       gray[j] = (0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]) | 0;
     }
 
-    // laplacian var
-    let lapVar = 0, mean = 0;
+    // Laplacian variance(초점)
+    let lapVar = 0, meanL = 0;
     const lap = new Float32Array(width * height);
     const k = [0,1,0,1,-4,1,0,1,0];
     const idx = (x: number, y: number) => y * width + x;
@@ -143,24 +161,23 @@ export default function PassportAutoCapture({
           k[0]*gray[idx(x-1,y-1)] + k[1]*gray[idx(x,y-1)] + k[2]*gray[idx(x+1,y-1)] +
           k[3]*gray[idx(x-1,y)]   + k[4]*gray[idx(x,y)]   + k[5]*gray[idx(x+1,y)] +
           k[6]*gray[idx(x-1,y+1)] + k[7]*gray[idx(x,y+1)] + k[8]*gray[idx(x+1,y+1)];
-        lap[idx(x,y)] = v; mean += v;
+        lap[idx(x,y)] = v; meanL += v;
       }
     }
     const N = (width - 2) * (height - 2) || 1;
-    mean /= N;
-    for (let i = 0; i < lap.length; i++) { const d = lap[i] - mean; lapVar += d * d; }
+    meanL /= N;
+    for (let i = 0; i < lap.length; i++) { const d = lap[i] - meanL; lapVar += d * d; }
     lapVar /= N;
 
-    // 밝은 픽셀 비율
+    // 밝기 채움
     let bright = 0;
     for (let i = 0; i < gray.length; i++) if (gray[i] > 60) bright++;
     const fillRatio = bright / gray.length;
 
-    // sobel edge
+    // Sobel
     const sobel = new Float32Array(width * height);
     const kx = [-1,0,1,-2,0,2,-1,0,1];
     const ky = [-1,-2,-1,0,0,0,1,2,1];
-    let maxMag = 1;
     for (let y = 1; y < height - 1; y++) {
       for (let x = 1; x < width - 1; x++) {
         const gx =
@@ -171,18 +188,22 @@ export default function PassportAutoCapture({
           ky[0]*gray[idx(x-1,y-1)] + ky[1]*gray[idx(x,y-1)] + ky[2]*gray[idx(x+1,y-1)] +
           ky[3]*gray[idx(x-1,y)]   + ky[4]*gray[idx(x,y)]   + ky[5]*gray[idx(x+1,y)] +
           ky[6]*gray[idx(x-1,y+1)] + ky[7]*gray[idx(x,y+1)] + ky[8]*gray[idx(x+1,y+1)];
-        const mag = Math.abs(gx) + Math.abs(gy);
-        sobel[idx(x,y)] = mag;
-        if (mag > maxMag) maxMag = mag;
+        sobel[idx(x,y)] = Math.abs(gx) + Math.abs(gy);
       }
     }
 
+    // 동적 임계치: mean + 1.2*std
+    let sum = 0, sum2 = 0;
+    for (let i = 0; i < sobel.length; i++) { const v = sobel[i]; sum += v; sum2 += v * v; }
+    const mean = sum / sobel.length;
+    const std = Math.sqrt(Math.max(0, sum2 / sobel.length - mean * mean));
+    const thr = mean + 1.2 * std; // 1.0~1.5 사이 튜닝 가능
+
     // 테두리 밴드 에지 비율
     const band = Math.max(1, Math.round((opts.edgeBandFrac ?? DEFAULT_OPTS.edgeBandFrac!) * Math.min(width, height)));
-    const thr = 0.25 * maxMag;
-    const topCount = countEdge(sobel, width, height, 0, 0, width, band, thr);
-    const botCount = countEdge(sobel, width, height, 0, height - band, width, band, thr);
-    const leftCount = countEdge(sobel, width, height, 0, 0, band, height, thr);
+    const topCount   = countEdge(sobel, width, height, 0, 0, width, band, thr);
+    const botCount   = countEdge(sobel, width, height, 0, height - band, width, band, thr);
+    const leftCount  = countEdge(sobel, width, height, 0, 0, band, height, thr);
     const rightCount = countEdge(sobel, width, height, width - band, 0, band, height, thr);
 
     const topR = topCount / (width * band);
@@ -192,16 +213,6 @@ export default function PassportAutoCapture({
 
     return { lapVar, fillRatio, edge: { topR, botR, leftR, rightR }, gray };
   }, [opts.edgeBandFrac]);
-
-  const countEdge = (sobel: Float32Array, w: number, h: number, sx: number, sy: number, sw: number, sh: number, thr: number) => {
-    let c = 0;
-    for (let y = sy; y < sy + sh; y++) {
-      for (let x = sx; x < sx + sw; x++) {
-        if (sobel[y * w + x] > thr) c++;
-      }
-    }
-    return c;
-  };
 
   const captureAndSend = useCallback(async (roiVid: { x: number; y: number; w: number; h: number }) => {
     if (!videoRef.current) return;
@@ -221,11 +232,12 @@ export default function PassportAutoCapture({
     onCaptured?.({ blob, dataUrl });
   }, [onCaptured]);
 
-  // 메인 루프
+  // --- 메인 루프 ---
   const startLoop = useCallback(() => {
     const loop = () => {
       rafRef.current = requestAnimationFrame(loop);
       if (!videoRef.current) return;
+
       const video = videoRef.current;
       if (!video.videoWidth || !video.videoHeight) return;
 
@@ -234,11 +246,12 @@ export default function PassportAutoCapture({
       const roiVid = guideToVideoRect(roiInView);
       if (!roiVid) return;
 
+      // 비율 체크(가이드 왜곡 방지)
       const ratio = roiVid.w / roiVid.h;
       const ratioOk = Math.abs(ratio - GUIDE_RATIO) <= 0.08;
 
-      // 분석용 다운스케일
-      const W = 320;
+      // 분석용 다운스케일 해상도 ↑
+      const W = 480;
       const scale = W / roiVid.w;
       const H = Math.max(1, Math.round(roiVid.h * scale));
 
@@ -251,7 +264,7 @@ export default function PassportAutoCapture({
       const img = wctx.getImageData(0, 0, W, H);
       const { lapVar, fillRatio, edge, gray } = analyzeRoi(img);
 
-      // 모션
+      // 모션(프레임간 평균차)
       let motion = 255;
       if (prevFrameRef.current && prevFrameRef.current.length === gray.length) {
         let sum = 0;
@@ -260,19 +273,19 @@ export default function PassportAutoCapture({
       }
       prevFrameRef.current = gray;
 
-      // 조건 체크
       const passSharp = lapVar >= (opts.sharpnessMin ?? DEFAULT_OPTS.sharpnessMin!);
       const passFill = fillRatio >= (opts.fillMin ?? DEFAULT_OPTS.fillMin!);
       const passMotion = motion <= (opts.motionMax ?? DEFAULT_OPTS.motionMax!);
       const edgeMin = (opts.edgeRatioMin ?? DEFAULT_OPTS.edgeRatioMin!);
       const passEdges = edge.topR >= edgeMin && edge.botR >= edgeMin && edge.leftR >= edgeMin && edge.rightR >= edgeMin;
+
       const elapsed = (performance.now() - startedAtRef.current) / 1000;
       const passTime = elapsed >= (opts.minSecondsBeforeCapture ?? DEFAULT_OPTS.minSecondsBeforeCapture!);
 
       const allPass = passSharp && passFill && passMotion && passEdges && ratioOk && passTime;
       setReadyVisual(allPass);
 
-      // 실패 이유 텍스트(간단, 작은 글씨로)
+      // 실패 이유 한 줄로
       const reasons: string[] = [];
       if (!passTime) reasons.push("카메라 안정화 중…");
       if (!passSharp) reasons.push("초점 부족");
@@ -287,7 +300,7 @@ export default function PassportAutoCapture({
         if (stableCountRef.current >= (opts.consecutiveFrames ?? DEFAULT_OPTS.consecutiveFrames!)) {
           setIsCapturing(true);
           captureAndSend(roiVid).finally(() => {
-            // 여러 장 연속 촬영 원하면 아래만 리셋
+            // 연속 촬영 원하면 아래만 리셋
             setIsCapturing(false);
             stableCountRef.current = 0;
             setReadyVisual(false);
@@ -311,14 +324,14 @@ export default function PassportAutoCapture({
         className="absolute inset-0 w-full h-full object-contain bg-black"
       />
 
-      {/* 큰 세로형 가이드: 높이 85vh 정도로 확대 */}
+      {/* 큰 세로형 가이드 (조건 충족=초록, 미충족=빨강) */}
       <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
         <div
           id="passport-guide-box"
           className={`relative rounded-xl border-4 ${readyVisual ? "border-emerald-500" : "border-red-500"}`}
           style={{
             aspectRatio: `${GUIDE_RATIO} / 1`,
-            height: "min(85vh, 95vw)", // 더 크게
+            height: "min(85vh, 95vw)", // 화면 거의 가득
           }}
         >
           <div className="absolute inset-0 rounded-xl shadow-[0_0_0_9999px_rgba(0,0,0,0.35)]" />
@@ -327,7 +340,7 @@ export default function PassportAutoCapture({
 
       {/* 상단 안내 */}
       <div className="absolute left-1/2 -translate-x-1/2 top-4 text-white/90 text-xs sm:text-sm px-3 py-1 rounded-full bg-black/50">
-        여권 한 면을 가이드 안에 꽉 차게 맞춘 뒤 가만히 유지해주세요. 조건 충족 시 자동 촬영됩니다.
+        여권 한 면을 가이드에 꽉 채워 평행하게 맞춘 뒤 잠시 고정해주세요. 조건 충족 시 자동 촬영됩니다.
       </div>
 
       {/* 하단 작은 상태/문제 문구 */}
