@@ -17,8 +17,8 @@ const DEFAULT_OPTS: AutoCaptureOptions = {
   sharpnessMin: 35,       // 초점(라플라시안 분산) 임계
   fillMin: 0.10,          // 충분한 밝기 비율
   motionMax: 10,          // 프레임간 차이(손떨림) 허용치
-  edgeBandFrac: 0.14,     // 테두리 밴드 두께 비율(ROI 대비)
-  edgeRatioMin: 0.10,     // 밴드 내 에지 픽셀 비율 임계
+  edgeBandFrac: 0.08,     // 테두리 밴드 두께 비율(ROI 대비)
+  edgeRatioMin: 0.05,     // 밴드 내 에지 픽셀 비율 임계
   minSecondsBeforeCapture: 1.0,
 };
 
@@ -197,7 +197,7 @@ export default function PassportAutoCapture({
     for (let i = 0; i < sobel.length; i++) { const v = sobel[i]; sum += v; sum2 += v * v; }
     const mean = sum / sobel.length;
     const std = Math.sqrt(Math.max(0, sum2 / sobel.length - mean * mean));
-    const thr = mean + 1.2 * std; // 1.0~1.5 사이 튜닝 가능
+    const thr = mean + 0.8 * std; // 1.0~1.5 사이 튜닝 가능
 
     // 테두리 밴드 에지 비율
     const band = Math.max(1, Math.round((opts.edgeBandFrac ?? DEFAULT_OPTS.edgeBandFrac!) * Math.min(width, height)));
